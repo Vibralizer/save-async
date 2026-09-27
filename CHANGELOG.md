@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.15.0] - 2026-09-27
+
+### Data integrity
+
+- `FileHandler.WriteFile` is atomic: it writes a temporary file beside the target (`<file>.tmp`), flushes it to disk, then replaces the target. A quit, crash, or power loss mid-write leaves either the complete previous file or the complete new one, never a torn mix. The bytes on disk are unchanged (UTF-8 without a BOM), so existing save files keep loading.
+- A file that cannot be parsed (torn, truncated, or corrupted) is quarantined instead of silently reset: `SaveManager.Load` renames it to `<file>.corrupt-<UTC timestamp>` (new `FileHandler.Quarantine`), logs an error, and only then restores that file's ISaveables to defaults. The quarantined copy is never overwritten. A file now restores all of its entries or none of them.
+- `SaveManager.Save` (and every other operation) is a real durability barrier: the returned Awaitable completes only when that operation has finished, even when another operation was already in flight. Before, it returned immediately in that case.
+- One failing operation no longer strands the operations queued behind it. The failure is thrown to the caller whose operation failed, and the queue keeps draining. Within one `Save` of several files, one file failing no longer stops the others.
+- A save that has started runs to completion when the app starts quitting instead of being cancelled mid-stream. Operations that have not started yet are still skipped once the app is quitting.
+- Fixed a race where a second caller cleared `IsBusy` while the drain loop was still running, which let two drain loops write the same file at once. `IsBusy` now stays true while anything is queued or running.
+- Every operation starts on the main thread (unless the background thread option is on), so `CaptureState` and `RestoreState` no longer run on a worker thread when an earlier operation in the same batch finished there.
+
+### Tests
+
+- Added EditMode tests (`Tests/Editor`) for a torn file, a concurrent `Save`, an exception mid-batch, a quit mid-write, a write that fails partway, and the unchanged on-disk format. To run them in a project, list `co.buck.saveasync` under `testables` in `Packages/manifest.json`.
+
 ## [0.14.0] – 2025-10-27
 
 ### Breaking Change: Scoped file routing

@@ -2,7 +2,9 @@
 
 using System;
 using System.Collections.Generic;
+using System.Runtime.ExceptionServices;
 using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -43,15 +45,22 @@ namespace Buck.SaveAsync
             LoadDefaults
         }
 
-        struct FileOperation
+        sealed class FileOperation
         {
-            public FileOperationType Type;
-            public string[] Filenames;
+            public readonly FileOperationType Type;
+            public readonly string[] Filenames;
+            public readonly OperationContext Context;
 
-            public FileOperation(FileOperationType operationType, string[] filenames)
+            // Resolved when THIS operation has finished (or failed), whichever caller's drain loop
+            // ran it. Awaiting it is what makes Save() a real durability barrier.
+            public readonly TaskCompletionSource<bool> Completion =
+                new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public FileOperation(FileOperationType operationType, string[] filenames, OperationContext context)
             {
                 Type = operationType;
                 Filenames = filenames;
+                Context = context;
             }
         }
 
@@ -108,7 +117,6 @@ namespace Buck.SaveAsync
         static FileHandler m_fileHandler;
 
         static readonly Dictionary<string, IBoxedSaveable> m_saveables = new();
-        static readonly List<LoadedSaveable> m_loadedSaveables = new();
         static readonly Queue<FileOperation> m_fileOperationQueue = new();
         static readonly Dictionary<string, StorageScope> s_fileScopes = new();
 
@@ -116,6 +124,11 @@ namespace Buck.SaveAsync
         static bool m_initialized;
 
         static int s_MainThreadId;
+
+        // The quit signal every operation is linked to. The package's EditMode tests swap in their
+        // own token to simulate a quit, because Unity raises Application.exitCancellationToken only
+        // when play mode exits or the player quits.
+        internal static Func<CancellationToken> ExitCancellationToken = () => Application.exitCancellationToken;
 
         static readonly JsonSerializerSettings s_jsonNoTypes = new()
         {
@@ -147,7 +160,7 @@ namespace Buck.SaveAsync
         #region SaveAsync API
 
         /// <summary>
-        /// Boolean indicating whether a file operation is in progress.
+        /// Boolean indicating whether a file operation is queued or in progress.
         /// </summary>
         public static bool IsBusy { get; private set; }
 
@@ -208,7 +221,10 @@ namespace Buck.SaveAsync
         }
 
         /// <summary>
-        /// Saves the files at the given paths or filenames.
+        /// Saves the files at the given paths or filenames. The returned Awaitable completes only
+        /// once these files are on disk, even when other file operations were queued ahead of this
+        /// one, so awaiting it is a durability barrier (for example before quitting). Awaiting it
+        /// throws if the save failed.
         /// <code>
         /// File example: "MyFile"
         /// Path example: "MyFolder/MyFile"
@@ -237,7 +253,10 @@ namespace Buck.SaveAsync
             => await Save(new[] { filename });
 
         /// <summary>
-        /// Loads the files at the given paths or filenames.
+        /// Loads the files at the given paths or filenames. The returned Awaitable completes once
+        /// their ISaveables have been restored. A file that cannot be parsed (torn by an interrupted
+        /// write, truncated, or corrupted) is moved aside with <see cref="FileHandler.Quarantine(string)"/>
+        /// before its ISaveables fall back to default state, so a later save never overwrites it.
         /// <code>
         /// File example: "MyFile"
         /// Path example: "MyFolder/MyFile"
@@ -396,9 +415,26 @@ namespace Buck.SaveAsync
 
         #endregion
 
+        // Test hook for the package's EditMode tests: forgets every registration and queued operation
+        // and swaps in the given file handler (null restores the normal lazy initialization).
+        internal static void ResetForTests(FileHandler fileHandler)
+        {
+            lock (s_QueueLock)
+            {
+                m_fileOperationQueue.Clear();
+                IsBusy = false;
+            }
+
+            m_saveables.Clear();
+            s_fileScopes.Clear();
+            SaveSlotIndex = -1;
+            m_fileHandler = fileHandler;
+            m_initialized = fileHandler != null;
+        }
+
         static OperationContext CreateContext()
         {
-            var linked = CancellationTokenSource.CreateLinkedTokenSource(Instance.destroyCancellationToken, Application.exitCancellationToken).Token;
+            var linked = CancellationTokenSource.CreateLinkedTokenSource(Instance.destroyCancellationToken, ExitCancellationToken()).Token;
             return new OperationContext
             {
                 UseBackgroundThread = Instance && Instance.m_useBackgroundThread,
@@ -410,107 +446,125 @@ namespace Buck.SaveAsync
 
         static async Awaitable DoFileOperation(FileOperationType requestedType, string[] requestedFilenames, OperationContext ctx)
         {
-            try
+            if (m_saveables.Count == 0)
             {
-                if (m_saveables.Count == 0)
-                {
-                    Debug.LogError("[Save Async] SaveManager.DoFileOperation() - No saveables have been registered. " +
-                             "Register ISaveable<TState> before using save, load, erase, or delete methods.");
-                    return;
-                }
+                Debug.LogError("[Save Async] SaveManager.DoFileOperation() - No saveables have been registered. " +
+                         "Register ISaveable<TState> before using save, load, erase, or delete methods.");
+                return;
+            }
+
+            var operation = new FileOperation(requestedType, requestedFilenames, ctx);
+            bool startDrain;
+
+            lock (s_QueueLock)
+            {
+                m_fileOperationQueue.Enqueue(operation);
+                startDrain = !IsBusy;
+                IsBusy = true;
+            }
+
+            // One drain loop at a time runs every queued operation in order, including the ones
+            // enqueued while it runs, and clears IsBusy once the queue is empty.
+            if (startDrain)
+                _ = DrainQueueAsync();
+
+            // Complete only when THIS operation has finished, even when another caller's drain loop
+            // is the one running it: awaiting Save() is a real durability barrier. A failed
+            // operation throws here, to its own caller.
+            await operation.Completion.Task;
+        }
+
+        static async Awaitable DrainQueueAsync()
+        {
+            while (true)
+            {
+                FileOperation operation;
 
                 lock (s_QueueLock)
                 {
-                    m_fileOperationQueue.Enqueue(new FileOperation(requestedType, requestedFilenames));
-                    if (IsBusy)
+                    if (m_fileOperationQueue.Count == 0)
+                    {
+                        IsBusy = false;
                         return;
-
-                    IsBusy = true;
-                }
-
-                if (ctx.UseBackgroundThread)
-                    await Awaitable.BackgroundThreadAsync();
-
-                bool processedLoad = false;
-                bool processedLoadDefaults = false;
-                var affectedFilenames = new HashSet<string>();
-
-                while (true)
-                {
-                    FileOperation fileOperation;
-
-                    lock (s_QueueLock)
-                    {
-                        if (m_fileOperationQueue.Count == 0)
-                            break;
-
-                        fileOperation = m_fileOperationQueue.Dequeue();
                     }
 
-                    switch (fileOperation.Type)
-                    {
-                        case FileOperationType.Save:
-                            await SaveFileOperationAsync(fileOperation.Filenames, ctx);
-                            break;
-
-                        case FileOperationType.Load:
-                            await LoadFileOperationAsync(fileOperation.Filenames, ctx);
-                            processedLoad = true;
-                            foreach (var f in fileOperation.Filenames)
-                                affectedFilenames.Add(f);
-                            break;
-
-                        case FileOperationType.Delete:
-                            await DeleteFileOperationAsync(fileOperation.Filenames, eraseAndKeepFile: false, ctx);
-                            break;
-
-                        case FileOperationType.Erase:
-                            await DeleteFileOperationAsync(fileOperation.Filenames, eraseAndKeepFile: true, ctx);
-                            break;
-
-                        case FileOperationType.LoadDefaults:
-                            processedLoadDefaults = true;
-                            foreach (var f in fileOperation.Filenames)
-                                affectedFilenames.Add(f);
-                            break;
-
-                        default:
-                            throw new ArgumentOutOfRangeException();
-                    }
+                    operation = m_fileOperationQueue.Dequeue();
                 }
 
-                // Always hop back to the main thread before touching Unity objects
-                // and before returning to the caller so their continuation resumes on main.
-                await Awaitable.MainThreadAsync();
-
-                if (processedLoad || processedLoadDefaults)
-                    RestorePass(affectedFilenames, processedLoad, processedLoadDefaults);
-
-                m_loadedSaveables.Clear();
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"[Save Async] SaveManager.DoFileOperation() - Exception: {e.Message}\n{e.StackTrace}");
-                throw;
-            }
-            finally
-            {
-                lock (s_QueueLock)
+                try
                 {
-                    IsBusy = false;
+                    await RunOperationAsync(operation);
+                    operation.Completion.TrySetResult(true);
+                }
+                catch (OperationCanceledException)
+                {
+                    operation.Completion.TrySetCanceled();
+                }
+                catch (Exception e)
+                {
+                    // A failure belongs to its own operation. The operations queued behind it still
+                    // run instead of being stranded until some later call starts a new drain.
+                    Debug.LogError($"[Save Async] SaveManager.DoFileOperation() - Exception: {e.Message}\n{e.StackTrace}");
+                    operation.Completion.TrySetException(e);
                 }
             }
         }
 
-        static void RestorePass(HashSet<string> affectedFilenames, bool didLoad, bool didDefaults)
+        static async Awaitable RunOperationAsync(FileOperation operation)
+        {
+            var ctx = operation.Context;
+
+            // Every operation starts on the main thread, where ISaveable.CaptureState and
+            // RestoreState run. The previous operation may have finished on a worker thread.
+            await Awaitable.MainThreadAsync();
+
+            // Nothing new starts once the app is quitting. An operation that has already started
+            // is not cancelled partway (see SaveFileOperationAsync).
+            if (ctx.CancellationToken.IsCancellationRequested)
+                return;
+
+            if (ctx.UseBackgroundThread)
+                await Awaitable.BackgroundThreadAsync();
+
+            switch (operation.Type)
+            {
+                case FileOperationType.Save:
+                    await SaveFileOperationAsync(operation.Filenames, ctx);
+                    break;
+
+                case FileOperationType.Load:
+                    var loaded = await LoadFileOperationAsync(operation.Filenames, ctx);
+                    await Awaitable.MainThreadAsync();
+                    RestorePass(new HashSet<string>(operation.Filenames), loaded, didLoad: true, didDefaults: false);
+                    break;
+
+                case FileOperationType.Delete:
+                    await DeleteFileOperationAsync(operation.Filenames, eraseAndKeepFile: false, ctx);
+                    break;
+
+                case FileOperationType.Erase:
+                    await DeleteFileOperationAsync(operation.Filenames, eraseAndKeepFile: true, ctx);
+                    break;
+
+                case FileOperationType.LoadDefaults:
+                    await Awaitable.MainThreadAsync();
+                    RestorePass(new HashSet<string>(operation.Filenames), null, didLoad: false, didDefaults: true);
+                    break;
+
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+        }
+
+        static void RestorePass(HashSet<string> affectedFilenames, List<LoadedSaveable> loadedSaveables, bool didLoad, bool didDefaults)
         {
             var restoredSaveables = new Dictionary<string, bool>(m_saveables.Count);
             foreach (var kvp in m_saveables)
                 restoredSaveables[kvp.Key] = false;
 
-            if (didLoad && m_loadedSaveables.Count > 0)
+            if (didLoad && loadedSaveables != null && loadedSaveables.Count > 0)
             {
-                foreach (var loaded in m_loadedSaveables)
+                foreach (var loaded in loadedSaveables)
                 {
                     if (loaded.Key == null)
                     {
@@ -575,9 +629,17 @@ namespace Buck.SaveAsync
             if (ct.IsCancellationRequested)
                 return;
 
-            try
+            List<ExceptionDispatchInfo> failures = null;
+
+            foreach (string filename in filenames)
             {
-                foreach (string filename in filenames)
+                // Each file starts on the main thread (unless the background thread option is on):
+                // capturing state and resolving the file's path touch Unity objects, and the
+                // previous write may have resumed on a worker thread.
+                if (!ctx.UseBackgroundThread)
+                    await Awaitable.MainThreadAsync();
+
+                try
                 {
                     var toSave = new List<IBoxedSaveable>();
                     foreach (var s in m_saveables.Values)
@@ -589,59 +651,97 @@ namespace Buck.SaveAsync
                         throw new InvalidOperationException($"[Save Async] SaveManager.SaveFileOperationAsync() - JSON serialization returned empty for file \"{filename}\".");
 
                     string encrypted = Encryption.Encrypt(json, ctx.EncryptionPassword, ctx.EncryptionType);
-                    await m_fileHandler.WriteFile(filename, encrypted, ct).ConfigureAwait(false);
+
+                    // Once started, a save runs to completion: cancelling a write partway at quit is
+                    // how torn save files happened. FileHandler.WriteFile is atomic, so even a killed
+                    // process leaves either the previous file or the new one on disk.
+                    await m_fileHandler.WriteFile(filename, encrypted, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception e)
+                {
+                    // One file failing does not stop the other files in this save.
+                    Debug.LogError($"[Save Async] SaveManager.SaveFileOperationAsync() - Exception while saving \"{filename}\": {e.Message}\n{e.StackTrace}");
+                    (failures ??= new List<ExceptionDispatchInfo>()).Add(ExceptionDispatchInfo.Capture(e));
                 }
             }
-            catch (Exception e)
-            {
-                Debug.LogError($"[Save Async] SaveManager.SaveFileOperationAsync() - Exception: {e.Message}\n{e.StackTrace}");
-                throw;
-            }
+
+            if (failures != null)
+                failures[0].Throw();
         }
 
-        static async Awaitable LoadFileOperationAsync(string[] filenames, OperationContext ctx)
+        static async Awaitable<List<LoadedSaveable>> LoadFileOperationAsync(string[] filenames, OperationContext ctx)
         {
             var ct = ctx.CancellationToken;
-            if (ct.IsCancellationRequested)
-                return;
+            var loadedSaveables = new List<LoadedSaveable>();
 
             try
             {
                 foreach (string filename in filenames)
                 {
+                    // Resolving the file's path touches Unity objects in some file handlers, and the
+                    // previous read may have resumed on a worker thread.
+                    if (!ctx.UseBackgroundThread)
+                        await Awaitable.MainThreadAsync();
+
                     string fileContent = await m_fileHandler.ReadFile(filename, ct).ConfigureAwait(false);
 
                     if (string.IsNullOrEmpty(fileContent))
                         continue;
 
-                    string json = Encryption.Decrypt(fileContent, ctx.EncryptionPassword, ctx.EncryptionType);
+                    if (TryParseEntries(fileContent, ctx, loadedSaveables, out var parseError))
+                        continue;
 
-                    try
-                    {
-                        var array = JArray.Parse(json);
-                        foreach (var item in array)
-                        {
-                            var key = item["Key"]?.ToString();
-                            int entryVersion = item["Version"]?.Value<int?>() ?? 0; // legacy entries will be 0
-                            var data = item["Data"];
-                            m_loadedSaveables.Add(new LoadedSaveable
-                            {
-                                Key = key,
-                                EntryVersion = entryVersion,
-                                Data = data
-                            });
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.LogError($"[Save Async] SaveManager.LoadFileOperationAsync() - Error deserializing JSON data: {ex.Message}\n{ex.StackTrace}");
-                    }
+                    // Unreadable: torn by an interrupted write, truncated, or corrupted. Move it aside
+                    // under a timestamped name BEFORE its ISaveables fall back to defaults, so the
+                    // next save can never overwrite whatever it still holds.
+                    if (!ctx.UseBackgroundThread)
+                        await Awaitable.MainThreadAsync();
+
+                    string quarantinedPath = await m_fileHandler.Quarantine(filename, CancellationToken.None).ConfigureAwait(false);
+                    Debug.LogError($"[Save Async] SaveManager.LoadFileOperationAsync() - The file \"{filename}\" is unreadable and was moved to \"{quarantinedPath}\". " +
+                                   $"Its ISaveables will use default state. Error: {parseError.Message}");
                 }
             }
             catch (Exception e)
             {
                 Debug.LogError($"[Save Async] SaveManager.LoadFileOperationAsync() - Exception: {e.Message}\n{e.StackTrace}");
                 throw;
+            }
+
+            return loadedSaveables;
+        }
+
+        // Decrypts and parses a whole file, and adds its entries only if ALL of it parsed, so a
+        // damaged file never half-restores.
+        static bool TryParseEntries(string fileContent, OperationContext ctx, List<LoadedSaveable> loadedSaveables, out Exception error)
+        {
+            try
+            {
+                string json = Encryption.Decrypt(fileContent, ctx.EncryptionPassword, ctx.EncryptionType);
+                var array = JArray.Parse(json);
+                var entries = new List<LoadedSaveable>(array.Count);
+
+                foreach (var item in array)
+                {
+                    var key = item["Key"]?.ToString();
+                    int entryVersion = item["Version"]?.Value<int?>() ?? 0; // legacy entries will be 0
+                    var data = item["Data"];
+                    entries.Add(new LoadedSaveable
+                    {
+                        Key = key,
+                        EntryVersion = entryVersion,
+                        Data = data
+                    });
+                }
+
+                loadedSaveables.AddRange(entries);
+                error = null;
+                return true;
+            }
+            catch (Exception e)
+            {
+                error = e;
+                return false;
             }
         }
 

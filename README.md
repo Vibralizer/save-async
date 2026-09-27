@@ -239,7 +239,7 @@ using Buck.SaveAsync
 ### Properties
 
 #### `bool IsBusy`
-Indicates whether or not the SaveManager class is currently busy with a file operation. This can be useful if you want to wait for one operation to finish before doing another, although because file operations are queued, this generally is only necessary for benchmarking and testing purposes.
+Indicates whether or not the SaveManager class has a file operation queued or in progress. Because file operations are queued and every returned `Awaitable` completes only when its own operation has finished, this is generally only necessary for benchmarking and testing purposes.
 <br>
 
 **Usage Example**:
@@ -274,7 +274,7 @@ Checks if a file exists at the given path or filename.
 <br>
 
 #### `Awaitable Save(string[] filenames)`
-Asynchronously saves the files at the specified array of paths or filenames.
+Asynchronously saves the files at the specified array of paths or filenames. The returned `Awaitable` completes only once these files are on disk, even if other operations were queued first, so awaiting it is a durability barrier (for example before quitting). Awaiting it throws if the save failed.
 
 **Usage Example**:
   ```csharp
@@ -319,6 +319,12 @@ Sets the given Guid byte array to a new Guid byte array if it is null, empty, or
   void OnValidate() => SaveManager.GetSerializableGuid(ref m_guidBytes);
   ```
 <br>
+
+## Data Safety
+
+- **Atomic writes**: every write goes to a temporary file (`<file>.tmp`), is flushed to disk, and then replaces the target. A quit, crash, or power loss mid-write leaves either the complete previous file or the complete new one.
+- **Quarantine**: if a file cannot be parsed when it is loaded (for example it was torn or corrupted), it is renamed to `<file>.corrupt-<UTC timestamp>` and an error is logged before its ISaveables fall back to defaults. The renamed copy is never overwritten, so the data can still be recovered by hand.
+- **Quitting**: a save that has already started runs to completion when the app starts quitting. Operations that have not started yet are skipped once the app is quitting.
 
 ## Encryption
 
