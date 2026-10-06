@@ -418,10 +418,24 @@ namespace Buck.SaveAsync
         // Test hook for the package's EditMode tests: forgets every registration and queued operation
         // and swaps in the given file handler (null restores the normal lazy initialization).
         internal static void ResetForTests(FileHandler fileHandler)
+            => ResetStatics(fileHandler);
+
+        // Every Play session starts from an empty SaveManager, with or without a domain reload
+        // (Enter Play Mode Settings, and Unity's CoreCLR runtime). Without one, the saveables,
+        // the file handler (a ScriptableObject Unity destroyed when the previous session ended)
+        // and the initialized flag would otherwise carry over, and the first Save of the new
+        // session would capture state from the previous session's destroyed objects.
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        static void ResetForPlaySession()
+            => ResetStatics(null);
+
+        static void ResetStatics(FileHandler fileHandler)
         {
             lock (s_QueueLock)
             {
-                m_fileOperationQueue.Clear();
+                // Operations still queued belong to the previous session; release their awaiters.
+                while (m_fileOperationQueue.Count > 0)
+                    m_fileOperationQueue.Dequeue().Completion.TrySetCanceled();
                 IsBusy = false;
             }
 
