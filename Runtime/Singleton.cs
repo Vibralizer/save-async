@@ -1,4 +1,4 @@
-﻿// MIT License - Copyright (c) 2025 BUCK Design LLC - https://github.com/buck-co
+// MIT License - Copyright (c) 2025 BUCK Design LLC - https://github.com/buck-co
 
 using UnityEngine;
 
@@ -14,6 +14,22 @@ namespace Buck.SaveAsync
         static bool m_ShuttingDown = false;
         static object m_Lock = new object();
         static T m_Instance;
+
+        // Unity does not invoke RuntimeInitializeOnLoadMethod inside a generic type, so every
+        // closed Singleton<T> registers its reset here and PlayModeStatics runs it at the start
+        // of each Play session. Without it, OnDestroy at the end of one editor Play session
+        // latches m_ShuttingDown and Instance returns null for the rest of the editor session.
+        static Singleton()
+            => PlayModeStatics.Register(ResetStatics);
+
+        static void ResetStatics()
+        {
+            lock (m_Lock)
+            {
+                m_Instance = null;
+                m_ShuttingDown = false;
+            }
+        }
 
         /// <summary>
         /// Access singleton instance through this property.
